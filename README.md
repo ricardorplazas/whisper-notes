@@ -118,6 +118,7 @@ label: Record meeting
 
 See **Releases** on GitHub for detailed notes.
 
+- **1.3.0** – Hardened inline recorder lifecycle, safer file naming, unified transcription/summarization pipeline, and added package metadata.
 - **1.2.3** – Fix “failed to load” syntax issue; ensure insertion order (Audio → Transcript → Summary); sturdier pause/resume/stop.
 - **1.2.2** – Add summary insertion after transcript with custom prompt.
 - **1.2.1** – Fix inline state handling; reliable pause/resume/stop.

@@ -5,7 +5,30 @@ const obsidian = require('obsidian');
 /** Utils **/
 function dtStamp(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`; }
 function sanitizeFilename(name){ return name.replace(/[\\/:*?"<>|]+/g,"-").trim(); }
-async function ensureFolder(app, folder){ const ex = await app.vault.adapter.exists(folder); if(!ex) await app.vault.createFolder(folder); }
+const ensureFolderCache=new Map();
+async function ensureFolder(app, folder){
+  const target=(0,obsidian.normalizePath)(folder||'/');
+  if(!target||target==='/'||target==='.') return target;
+  if(ensureFolderCache.has(target)) return ensureFolderCache.get(target);
+  const promise=(async()=>{
+    const parts=target.split('/');
+    let current='';
+    for(const part of parts){
+      current=current?`${current}/${part}`:part;
+      const normalized=(0,obsidian.normalizePath)(current);
+      try{
+        if(!(await app.vault.adapter.exists(normalized))){
+          await app.vault.createFolder(normalized);
+        }
+      }catch(err){
+        if(!/exists/i.test(err?.message||'')) throw err;
+      }
+    }
+    return target;
+  })();
+  ensureFolderCache.set(target,promise);
+  return promise;
+}
 function humanTime(ms){ const s=Math.floor(ms/1000); const h=Math.floor(s/3600); const m=Math.floor((s%3600)/60); const sec=s%60; const p=n=>String(n).padStart(2,'0'); return h>0?`${h}:${p(m)}:${p(sec)}`:`${m}:${p(sec)}`; }
 
 /** Settings **/
@@ -41,6 +64,7 @@ class RecorderController{
   get isRecording(){ return this._isRecording }
   get isPaused(){ return this._isPaused }
   async start(){
+    if(this._isRecording) throw new Error("Recorder is already running");
     if(!navigator?.mediaDevices?.getUserMedia){ new obsidian.Notice("Microphone not available on this device/browser."); throw new Error("No mediaDevices"); }
     this.mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
     this._isRecording=true; this._isPaused=false; this.levelStart(this.mediaStream);
@@ -152,13 +176,31 @@ async function runSummary(plugin, transcript){
 }
 
 /** Inline recorder view **/
-class InlineRecorderView{
-  constructor(plugin, el, label, sectionCtx){ this.plugin=plugin; this.el=el; this.label=label; this.controller=new RecorderController(plugin); this.sectionCtx=sectionCtx; this.state='idle'; this.elapsed=0; this.elapsedTimer=null; this.render(); }
-  render(){
-    const root=this.el.createDiv({cls:"meeting-recorder-inline"});
-    const header=root.createEl("div",{cls:"header"}); header.createSpan({text:"🎙️ "+this.label});
-    const row=root.createDiv({cls:"row"}); this.lightEl=row.createDiv({cls:"meeting-recorder-light"}); this.timerEl=row.createDiv({cls:"meeting-recorder-timer", text:"0:00"});
-    const wave=root.createDiv({cls:"meeting-recorder-wave"}); this.bars=[]; for(let i=0;i<48;i++) this.bars.push(wave.createDiv({cls:"bar"}));
+class InlineRecorderView extends obsidian.MarkdownRenderChild{
+  constructor(plugin, containerEl, label, sectionCtx){
+    super(containerEl);
+    this.plugin=plugin;
+    this.sectionCtx=sectionCtx;
+    this.label=label;
+    this.controller=new RecorderController(plugin);
+    this.state='idle';
+    this.elapsed=0;
+    this.elapsedTimer=null;
+    this.levelConsumer=null;
+    this.bars=[];
+    this.build();
+  }
+  build(){
+    this.containerEl.empty();
+    const root=this.containerEl.createDiv({cls:"meeting-recorder-inline"});
+    this.root=root;
+    const header=root.createEl("div",{cls:"header"});
+    header.createSpan({text:`🎙️ ${this.label}`});
+    const row=root.createDiv({cls:"row"});
+    this.lightEl=row.createDiv({cls:"meeting-recorder-light"});
+    this.timerEl=row.createDiv({cls:"meeting-recorder-timer", text:"0:00"});
+    const wave=root.createDiv({cls:"meeting-recorder-wave"});
+    for(let i=0;i<48;i++) this.bars.push(wave.createDiv({cls:"bar"}));
     root.createDiv({cls:"meeting-divider"});
     const controls=root.createDiv({cls:"meeting-controls"});
     this.startBtn=controls.createEl("button",{text:"▶ Start",cls:"mr-btn mr-btn-primary"});
@@ -166,68 +208,130 @@ class InlineRecorderView{
     this.resumeBtn=controls.createEl("button",{text:"▶ Resume",cls:"mr-btn"});
     this.stopBtn=controls.createEl("button",{text:"⏹ Stop",cls:"mr-btn mr-btn-danger"});
     this.tsBtn=controls.createEl("button",{text:"⏱ Insert timestamp",cls:"mr-btn"});
-    this.pauseBtn.setAttr("disabled","true"); this.resumeBtn.setAttr("disabled","true"); this.stopBtn.setAttr("disabled","true"); this.tsBtn.setAttr("disabled","true");
+    this.pauseBtn.setAttr("disabled","true");
+    this.resumeBtn.setAttr("disabled","true");
+    this.stopBtn.setAttr("disabled","true");
+    this.tsBtn.setAttr("disabled","true");
     this.statusEl=root.createDiv({cls:"meeting-status", text:""});
-    this.bind();
+    this.bindControls();
   }
-  setState(next){
-    this.state=next; const on=(b,v)=> v?b.removeAttribute('disabled'):b.setAttr('disabled','true');
-    if(next==='idle'){ on(this.startBtn,true); on(this.pauseBtn,false); on(this.resumeBtn,false); on(this.stopBtn,false); on(this.tsBtn,false); this.lightEl.removeClass('recording'); this.statusEl.setText(''); }
-    else if(next==='recording'){ on(this.startBtn,false); on(this.pauseBtn,true); on(this.resumeBtn,false); on(this.stopBtn,true); on(this.tsBtn,true); this.lightEl.addClass('recording'); this.statusEl.setText('Recording…'); }
-    else if(next==='paused'){ on(this.startBtn,false); on(this.pauseBtn,false); on(this.resumeBtn,true); on(this.stopBtn,true); on(this.tsBtn,true); this.lightEl.removeClass('recording'); this.statusEl.setText('Paused'); }
-    else{ on(this.startBtn,false); on(this.pauseBtn,false); on(this.resumeBtn,false); on(this.stopBtn,false); on(this.tsBtn,false); this.lightEl.removeClass('recording'); this.statusEl.setText('Finalizing…'); }
+  onunload(){
+    this.stopTimer();
+    this.detachLevelConsumer();
+    if(this.controller?.isRecording){
+      Promise.resolve(this.controller.stop()).catch(()=>{});
+    }
   }
-  startTimer(){ this.stopTimer(); this.startTs=Date.now()-this.elapsed; this.elapsedTimer=window.setInterval(()=>{ this.elapsed=Date.now()-this.startTs; this.timerEl.setText(humanTime(this.elapsed)); },250); }
-  stopTimer(){ if(this.elapsedTimer){ window.clearInterval(this.elapsedTimer); this.elapsedTimer=null; } }
-  resetTimer(){ this.stopTimer(); this.elapsed=0; this.timerEl.setText('0:00'); }
-  bind(){
-    this.startBtn.addEventListener("click", async()=>{
+  bindControls(){
+    this.registerDomEvent(this.startBtn,"click", async()=>{
       if(this.state!=='idle') return;
       try{
         this.statusEl.setText("Requesting microphone…");
         const info=await this.controller.start();
-        this.setState('recording'); this.startTimer();
+        this.setState('recording');
+        this.startTimer();
+        this.attachLevelConsumer();
         this.statusEl.setText(`Recording (${info.fallback?"WAV fallback":info.mimeType||"audio"})…`);
-        this.levelConsumer=(l)=>this.updateLevel(l); this.plugin.addLevelConsumer(this.levelConsumer);
-      }catch(e){ console.error(e); this.setState('idle'); this.statusEl.setText(""); new obsidian.Notice("Failed to start recording. Check microphone permissions."); }
+      }catch(e){
+        console.error(e);
+        this.setState('idle');
+        this.statusEl.setText("");
+        if(e?.message!=='Recorder is already running') new obsidian.Notice("Failed to start recording. Check microphone permissions.");
+      }
     });
-    this.pauseBtn.addEventListener("click", ()=>{ if(this.state!=='recording') return; try{ this.controller.pause(); }catch{}; this.stopTimer(); this.setState('paused'); });
-    this.resumeBtn.addEventListener("click", ()=>{ if(this.state!=='paused') return; try{ this.controller.resume(); }catch{}; this.startTimer(); this.setState('recording'); });
-    this.stopBtn.addEventListener("click", async()=>{
+    this.registerDomEvent(this.pauseBtn,"click", ()=>{
+      if(this.state!=='recording') return;
+      try{ this.controller.pause(); }catch(err){ console.error(err); }
+      this.stopTimer();
+      this.setState('paused');
+    });
+    this.registerDomEvent(this.resumeBtn,"click", ()=>{
+      if(this.state!=='paused') return;
+      try{ this.controller.resume(); }catch(err){ console.error(err); }
+      this.startTimer();
+      this.setState('recording');
+    });
+    this.registerDomEvent(this.stopBtn,"click", async()=>{
       if(this.state!=='recording'&&this.state!=='paused') return;
-      this.setState('finalizing'); this.stopTimer();
-      let blob=null; try{ blob=await this.controller.stop(); }catch(e){ console.error(e); }
-      if(this.levelConsumer){ this.plugin.removeLevelConsumer(this.levelConsumer); this.levelConsumer=undefined; }
-      try{
-        if(!blob){ this.statusEl.setText("Nothing recorded."); this.setState('idle'); this.resetTimer(); return; }
-        const baseName=(this.sectionCtx?.sourcePath?.split('/')?.pop()||'meeting').replace(/\.md$/i,'');
-        const path=await this.plugin.saveAudioBlob(blob, baseName);
-        this.statusEl.setText(`Saved: ${path}`);
-        if(this.sectionCtx){ try{ await this.plugin.insertAudioBelow(this.sectionCtx, path); }catch(e){ console.error(e);} }
-        if(this.plugin.settings.autoTranscribe){
-          this.statusEl.setText("Transcribing…");
-          const {text,error}=await transcribeBlob(this.plugin, blob);
-          if(error){ new obsidian.Notice(error); this.statusEl.setText("Transcription failed."); }
-          else{
-            let sumText=""; if(this.plugin.settings.insertSummaryAfterTranscript){ this.statusEl.setText("Summarizing…"); const res=await runSummary(this.plugin, text); if(res.ok) sumText=res.text; }
-            if(this.sectionCtx){ await this.plugin.insertTranscriptAndSummaryBelow(this.sectionCtx, text, path, sumText); } else { await this.plugin.insertTranscript(text, sumText); }
-            this.statusEl.setText("Transcript (and summary) inserted.");
-          }
-        }
-      }catch(e){ console.error(e); new obsidian.Notice("Failed to save or transcribe recording."); }
-      finally{ this.setState('idle'); this.resetTimer(); }
+      await this.finalizeRecording();
     });
-    this.tsBtn.addEventListener("click", ()=>{
+    this.registerDomEvent(this.tsBtn,"click", ()=>{
       const view=this.plugin.app.workspace.getActiveViewOfType(obsidian.MarkdownView);
       if(view?.editor){ const ts=humanTime(this.elapsed); view.editor.replaceSelection(`⏱ ${ts} — `); }
     });
   }
-  updateLevel(level){
-    const intensity=Math.max(0.05,level); const n=this.bars.length;
-    for(let i=0;i<n;i++){ const factor=1+intensity*(0.6+1.4*(i/(n-1))); this.bars[i].style.transform=`scaleY(${factor.toFixed(3)})`; }
+  setButtonEnabled(button, enabled){ if(!button) return; if(enabled) button.removeAttribute('disabled'); else button.setAttr('disabled','true'); }
+  setState(next){
+    this.state=next;
+    if(next==='idle'){
+      this.setButtonEnabled(this.startBtn,true);
+      this.setButtonEnabled(this.pauseBtn,false);
+      this.setButtonEnabled(this.resumeBtn,false);
+      this.setButtonEnabled(this.stopBtn,false);
+      this.setButtonEnabled(this.tsBtn,false);
+      this.lightEl.removeClass('recording');
+      this.statusEl.setText('');
+    }else if(next==='recording'){
+      this.setButtonEnabled(this.startBtn,false);
+      this.setButtonEnabled(this.pauseBtn,true);
+      this.setButtonEnabled(this.resumeBtn,false);
+      this.setButtonEnabled(this.stopBtn,true);
+      this.setButtonEnabled(this.tsBtn,true);
+      this.lightEl.addClass('recording');
+      this.statusEl.setText('Recording…');
+    }else if(next==='paused'){
+      this.setButtonEnabled(this.startBtn,false);
+      this.setButtonEnabled(this.pauseBtn,false);
+      this.setButtonEnabled(this.resumeBtn,true);
+      this.setButtonEnabled(this.stopBtn,true);
+      this.setButtonEnabled(this.tsBtn,true);
+      this.lightEl.removeClass('recording');
+      this.statusEl.setText('Paused');
+    }else{
+      this.setButtonEnabled(this.startBtn,false);
+      this.setButtonEnabled(this.pauseBtn,false);
+      this.setButtonEnabled(this.resumeBtn,false);
+      this.setButtonEnabled(this.stopBtn,false);
+      this.setButtonEnabled(this.tsBtn,false);
+      this.lightEl.removeClass('recording');
+      this.statusEl.setText('Finalizing…');
+    }
   }
+  startTimer(){ this.stopTimer(); this.startTs=Date.now()-this.elapsed; this.elapsedTimer=window.setInterval(()=>{ this.elapsed=Date.now()-this.startTs; this.timerEl.setText(humanTime(this.elapsed)); },250); }
+  stopTimer(){ if(this.elapsedTimer){ window.clearInterval(this.elapsedTimer); this.elapsedTimer=null; } }
+  resetTimer(){ this.stopTimer(); this.elapsed=0; this.timerEl.setText('0:00'); }
+  attachLevelConsumer(){ if(this.levelConsumer) return; this.levelConsumer=(l)=>this.updateLevel(l); this.plugin.addLevelConsumer(this.levelConsumer); }
+  detachLevelConsumer(){ if(this.levelConsumer){ this.plugin.removeLevelConsumer(this.levelConsumer); this.levelConsumer=null; } }
+  async finalizeRecording(){
+    this.setState('finalizing');
+    this.stopTimer();
+    let blob=null;
+    try{ blob=await this.controller.stop(); }
+    catch(e){ console.error(e); }
+    this.detachLevelConsumer();
+    try{
+      if(!blob){ this.statusEl.setText("Nothing recorded."); this.setState('idle'); this.resetTimer(); return; }
+      const baseName=this.plugin.deriveRecordingBaseName(this.sectionCtx, this.label);
+      const path=await this.plugin.saveAudioBlob(blob, baseName);
+      this.statusEl.setText(`Saved: ${path}`);
+      if(this.sectionCtx){ try{ await this.plugin.insertAudioBelow(this.sectionCtx, path); }catch(err){ console.error(err); } }
+      const {transcript, summary, error, didTranscribe}=await this.plugin.transcribeAndSummarize(blob,{
+        onTranscribeStart:()=>this.statusEl.setText("Transcribing…"),
+        onSummaryStart:()=>this.statusEl.setText("Summarizing…"),
+      });
+      if(error){ this.statusEl.setText("Transcription failed."); new obsidian.Notice(error); }
+      else if(transcript||summary){
+        if(this.sectionCtx){ await this.plugin.insertTranscriptAndSummaryBelow(this.sectionCtx, transcript, path, summary); }
+        else{ await this.plugin.insertTranscript(transcript, summary); }
+        this.statusEl.setText(summary?"Transcript and summary inserted.":"Transcript inserted.");
+      }else if(didTranscribe){
+        this.statusEl.setText("Recording saved (no transcript returned).");
+      }
+    }catch(e){ console.error(e); new obsidian.Notice("Failed to save or transcribe recording."); }
+    finally{ this.setState('idle'); this.resetTimer(); }
+  }
+  updateLevel(level){ if(!this.bars?.length) return; const intensity=Math.max(0.05,level); const n=this.bars.length; for(let i=0;i<n;i++){ const factor=1+intensity*(0.6+1.4*(i/(n-1))); this.bars[i].style.transform=`scaleY(${factor.toFixed(3)})`; } }
 }
-
 /** Modal recorder **/
 class RecorderModal extends obsidian.Modal{
   constructor(plugin, initialLabel="Record meeting"){ super(plugin.app); this.plugin=plugin; this.label=initialLabel; this.controller=new RecorderController(plugin); this.elapsed=0; this.elapsedTimer=null; this.state='idle'; }
@@ -269,17 +373,18 @@ class RecorderModal extends obsidian.Modal{
       let blob=null; try{ blob=await this.controller.stop(); }catch(e){ console.error(e); }
       try{
         if(!blob){ this.statusEl.setText("Nothing recorded."); setState('idle'); resetTimer(); return; }
-        const path=await this.plugin.saveAudioBlob(blob);
+        const path=await this.plugin.saveAudioBlob(blob, this.plugin.deriveRecordingBaseName(undefined, this.label));
         this.statusEl.setText(`Saved: ${path}`);
-        if(this.plugin.settings.autoTranscribe){
-          this.statusEl.setText("Transcribing…");
-          const {text,error}=await transcribeBlob(this.plugin, blob);
-          if(error){ this.statusEl.setText("Transcription failed."); new obsidian.Notice(error); }
-          else{
-            let sumText=""; if(this.plugin.settings.insertSummaryAfterTranscript){ this.statusEl.setText("Summarizing…"); const res=await runSummary(this.plugin, text); if(res.ok) sumText=res.text; }
-            await this.plugin.insertTranscript(text, sumText);
-            this.statusEl.setText("Transcript (and summary) inserted.");
-          }
+        const {transcript, summary, error, didTranscribe}=await this.plugin.transcribeAndSummarize(blob,{
+          onTranscribeStart:()=>this.statusEl.setText("Transcribing…"),
+          onSummaryStart:()=>this.statusEl.setText("Summarizing…"),
+        });
+        if(error){ this.statusEl.setText("Transcription failed."); new obsidian.Notice(error); }
+        else if(transcript||summary){
+          await this.plugin.insertTranscript(transcript, summary);
+          this.statusEl.setText(summary?"Transcript (and summary) inserted.":"Transcript inserted.");
+        }else if(didTranscribe){
+          this.statusEl.setText("Recording saved (no transcript returned).");
         }
       }catch(e){ console.error(e); new obsidian.Notice("Failed to save or transcribe recording."); }
       finally{ setState('idle'); resetTimer(); }
@@ -300,7 +405,8 @@ class WhisperNotesPlugin extends obsidian.Plugin{
       const lines = src.split("\\n").map(s=>s.trim()).filter(Boolean);
       let label="Record meeting"; for(const l of lines){ const m=l.match(/^label\\s*:\\s*(.+)$/i); if(m) label=m[1]; }
       const info = ctx.getSectionInfo(el); const sectionCtx = info ? { sourcePath: ctx.sourcePath, lineStart: info.lineStart, lineEnd: info.lineEnd } : undefined;
-      new InlineRecorderView(this, el, label, sectionCtx);
+      const child=new InlineRecorderView(this, el, label, sectionCtx);
+      ctx.addChild(child);
     };
     this.registerMarkdownCodeBlockProcessor("whisper-notes", makeRenderer);
     this.registerMarkdownCodeBlockProcessor("meeting-recorder", makeRenderer);
@@ -321,11 +427,47 @@ class WhisperNotesPlugin extends obsidian.Plugin{
   }
   async saveAudioBlob(blob, baseName){
     const ext = blob.type?.includes("wav") ? "wav" : (blob.type?.includes("ogg") ? "ogg" : "webm");
-    const folder = this.settings.audioFolder || "Recordings"; await ensureFolder(this.app, folder);
-    let name = baseName ? sanitizeFilename(baseName) : `meeting-${dtStamp()}`;
-    let path = `${folder}/${name}.${ext}`;
-    try{ if(await this.app.vault.adapter.exists(path)) path = `${folder}/${name} ${dtStamp()}.${ext}`; }catch{}
-    const buf = await blob.arrayBuffer(); await this.app.vault.createBinary(path, buf); return path;
+    const folderSetting=this.settings.audioFolder || "Recordings";
+    const folder=await ensureFolder(this.app, folderSetting) || folderSetting;
+    const sanitizedBase=sanitizeFilename(baseName||"")||`meeting-${dtStamp()}`;
+    const base=sanitizedBase.replace(/\.+$/,'');
+    const data=await blob.arrayBuffer();
+    const makePath=(suffix)=>{ const name=suffix?`${base} ${suffix}`:base; return (0,obsidian.normalizePath)(`${folder}/${name}.${ext}`); };
+    const tryCreate=async(path)=>{
+      try{ await this.app.vault.createBinary(path, data); return path; }
+      catch(err){ if(/exists/i.test(err?.message||"")) return null; throw err; }
+    };
+    let path=await tryCreate(makePath(""));
+    if(path) return path;
+    for(let attempt=0; attempt<3 && !path; attempt++){
+      path=await tryCreate(makePath(`${dtStamp()}${attempt?`-${attempt}`:""}`));
+    }
+    if(path) return path;
+    const fallback=(0,obsidian.normalizePath)(`${folder}/meeting-${dtStamp()}-${Math.random().toString(36).slice(2,8)}.${ext}`);
+    await this.app.vault.createBinary(fallback, data);
+    return fallback;
+  }
+  deriveRecordingBaseName(sectionCtx, label=""){
+    const noteName=sectionCtx?.sourcePath?.split('/')?.pop()?.replace(/\.md$/i,'')||'';
+    const parts=[];
+    if(noteName) parts.push(sanitizeFilename(noteName));
+    const trimmedLabel=label?.trim?.();
+    if(trimmedLabel) parts.push(sanitizeFilename(trimmedLabel));
+    if(!parts.length) parts.push('meeting');
+    return parts.join(' - ');
+  }
+  async transcribeAndSummarize(blob,{onTranscribeStart,onSummaryStart}={}){
+    if(!this.settings.autoTranscribe) return {transcript:"", summary:"", error:null, didTranscribe:false, didSummarize:false};
+    onTranscribeStart?.();
+    const {text,error}=await transcribeBlob(this, blob);
+    if(error) return {transcript:"", summary:"", error, didTranscribe:true, didSummarize:false};
+    let summary=""; let didSummarize=false;
+    if(text && this.settings.insertSummaryAfterTranscript){
+      onSummaryStart?.();
+      const res=await runSummary(this, text);
+      if(res.ok){ summary=res.text; didSummarize=true; }
+    }
+    return {transcript:text, summary, error:null, didTranscribe:true, didSummarize};
   }
   async insertTranscript(transcript, summary=""){
     const s=this.settings; const folder=s.transcriptFolder||"Recordings"; await ensureFolder(this.app, folder);
