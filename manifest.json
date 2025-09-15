@@ -1,7 +1,7 @@
 {
   "id": "whisper-notes",
   "name": "Whisper Notes",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "minAppVersion": "1.4.0",
   "description": "Record while you type. Adds an inline audio recorder to notes, saves the audio file, and optionally transcribes with Whisper. Run LLM post\u2011processing (summary, to\u2011dos, action items) with your own API keys.",
   "author": "Ricardo Rodriguez",
